@@ -102,6 +102,64 @@ def main(argv):
         total = jnp.sum(output_mask, axis=-1)
         is_greedy = match_count == total
         return loglikelihood, is_greedy, rng_generator()
+    
+
+    @partial(
+        pjit,
+        in_shardings=(model_ps, PS(), PS()),
+        out_shardings=(PS(), PS())
+    )
+    def forward_next_token_logits(params, rng, batch):
+        batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
+        rng_generator = JaxRNG(rng)
+        input_tokens = batch['input_tokens']
+        input_mask = batch['input_mask']
+        print(input_tokens.shape, input_mask.shape)
+
+        output_class_tokens = batch['classes_tokens']
+        print(output_class_tokens.shape)
+
+        logits = hf_model.module.apply(
+            params, input_tokens, attention_mask=input_mask,
+            deterministic=True, rngs=rng_generator(llama_config.rng_keys()),
+        ).logits # (batch_size, seq_length, vocab_size)
+        print(logits.shape)
+
+        logits = logits[0, -1, :] # (vocab_size,)
+
+        logprobs = jax.nn.log_softmax(logits, axis=0)
+        
+        return logprobs[output_class_tokens], rng_generator()
+
+
+    @partial(
+        pjit,
+        in_shardings=(model_ps, PS(), PS(), PS(), PS()),
+        out_shardings=(PS(), PS())
+    )
+    def forward_generate_input_ids(params, rng, batch, temperature, max_new_tokens):
+        print('pad, bos, eos:', tokenizer.eos_token_id, tokenizer.bos_token_id, tokenizer.eos_token_id)
+        
+        batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
+        rng_generator = JaxRNG(rng)
+        output = hf_model.generate(
+            batch['input_tokens'],
+            attention_mask=batch['input_mask'],
+            params=params['params'],
+            prng_key=rng_generator(),
+            logits_processor=FlaxLogitsProcessorList(
+                [FlaxTemperatureLogitsWarper(temperature)]
+            ),
+            generation_config=GenerationConfig(
+                max_new_tokens=64,
+                pad_token_id=tokenizer.eos_token_id,
+                bos_token_id=tokenizer.bos_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                do_sample=False,
+                num_beams=1,
+            )
+        ).sequences[:, batch['input_tokens'].shape[1]:]
+        return output, rng_generator()
 
 
     @partial(
@@ -163,6 +221,52 @@ def main(argv):
         sharded_rng = next_rng()
 
     class ModelServer(LMServer):
+
+        @staticmethod
+        def loglikelihood_next_token(input_tokens_rq, classes_tokens_rq):
+            nonlocal sharded_rng
+
+            print(input_tokens_rq, classes_tokens_rq)
+
+            input_tokens = np.array([input_tokens_rq])
+            classes_tokens = np.array(classes_tokens_rq)
+
+            input_mask = np.ones_like(input_tokens)
+
+            batch = dict(
+                input_tokens=input_tokens,
+                input_mask=input_mask,
+                classes_tokens=classes_tokens,
+            )
+            with mesh:
+                logprobs, sharded_rng = forward_next_token_logits(
+                    params, sharded_rng, batch
+                )
+                logprobs, = jax.device_get((logprobs,))
+            return logprobs
+
+        @staticmethod
+        def generate_input_ids(input_ids, temperature, max_new_tokens):
+            nonlocal sharded_rng
+
+            input_tokens = np.array([input_ids])
+            input_mask = np.ones_like(input_tokens)
+
+            batch = dict(
+                input_tokens=input_tokens,
+                input_mask=input_mask
+            )
+
+            with mesh:
+                new_tokens, sharded_rng = forward_generate_input_ids(
+                    params, sharded_rng, batch, temperature, max_new_tokens
+                )
+                
+                print(new_tokens, new_tokens.shape)
+                new_tokens, = jax.device_get((new_tokens[0],))
+
+            return new_tokens
+            
 
         @staticmethod
         def loglikelihood(prefix_text, text):

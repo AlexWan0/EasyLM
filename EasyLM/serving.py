@@ -21,6 +21,16 @@ import requests
 from requests.exceptions import Timeout, ConnectionError
 
 
+class GreedyInputIdsRequest(BaseModel):
+    input_tokens: List[int] = None
+    temperature: float = None
+    max_new_tokens: int = None
+
+
+class NextTokenRequest(BaseModel):
+    input_tokens_rq: List[int] = None
+    classes_tokens_rq: List[int] = None
+
 class InferenceRequest(BaseModel):
     prefix_text: Optional[List[str]] = None
     text: Optional[List[str]] = None
@@ -68,8 +78,10 @@ class LMServer(object):
         self.app = FastAPI()
         self.app.post('/loglikelihood')(self.serve_loglikelihood)
         self.app.post('/loglikelihood-rolling')(self.serve_loglikelihood_rolling)
+        self.app.post('/loglikelihood-next-token')(self.serve_loglikelihood_next_token)
         self.app.post('/generate')(self.serve_generate)
         self.app.post('/greedy-until')(self.serve_greedy_until)
+        self.app.post('/greedy-ids')(self.serve_greedy_ids)
         self.app.post('/chat')(self.serve_chat)
         self.app.get('/ready')(self.serve_ready)
         self.app = gr.mount_gradio_app(self.app, self.create_chat_app(), '/')
@@ -78,6 +90,10 @@ class LMServer(object):
     def loglikelihood(prefix_text, text):
         raise NotImplementedError()
 
+    @staticmethod
+    def loglikelihood_next_token(input_tokens_rq, classes_tokens_rq):
+        raise NotImplementedError()
+    
     @staticmethod
     def loglikelihood_rolling(text):
         raise NotImplementedError()
@@ -91,6 +107,10 @@ class LMServer(object):
         raise NotImplementedError()
 
     @staticmethod
+    def generate_input_ids(input_ids, temperature, max_new_tokens):
+        raise NotImplementedError()
+
+    @staticmethod
     def to_list(x):
         if isinstance(x, np.ndarray):
             return x.tolist()
@@ -98,6 +118,54 @@ class LMServer(object):
 
     def serve_ready(self):
         return 'Ready!\n'
+
+    def serve_loglikelihood_next_token(self, data: NextTokenRequest):
+        with self.lock:
+            if self.config.logging:
+                absl.logging.info(
+                    '\n========= Serving Log Likelihood Next-token Request ========= \n'
+                    + pprint.pformat(data) + '\n'
+                )
+
+            logprobs = self.loglikelihood_next_token(
+                data.input_tokens_rq, data.classes_tokens_rq
+            )
+            logprobs = self.to_list(logprobs)
+
+            output = {
+                'logprobs': logprobs
+            }
+            if self.config.logging:
+                absl.logging.info(
+                '\n========= Output ========= \n'
+                + pprint.pformat(output) + '\n'
+            )
+
+        return output
+
+    def serve_greedy_ids(self, data: GreedyInputIdsRequest):
+        with self.lock:
+            if self.config.logging:
+                absl.logging.info(
+                    '\n========= Serving Greedy Input Ids Request ========= \n'
+                    + pprint.pformat(data) + '\n'
+                )
+
+            new_tokens = self.generate_input_ids(
+                data.input_tokens, data.temperature, data.max_new_tokens
+            )
+            new_tokens = self.to_list(new_tokens)
+
+            output = {
+                'new_tokens': new_tokens
+            }
+            if self.config.logging:
+                absl.logging.info(
+                '\n========= Output ========= \n'
+                + pprint.pformat(output) + '\n'
+            )
+
+        return output
 
     def serve_loglikelihood(self, data: InferenceRequest):
         with self.lock:
