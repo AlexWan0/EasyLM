@@ -106,26 +106,26 @@ def main(argv):
 
     @partial(
         pjit,
-        in_shardings=(model_ps, PS(), PS()),
+        in_shardings=(model_ps, PS(), PS(), PS()),
         out_shardings=(PS(), PS())
     )
-    def forward_next_token_logits(params, rng, batch):
+    def forward_next_token_logits(params, rng, batch, target_pos):
         batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
         rng_generator = JaxRNG(rng)
         input_tokens = batch['input_tokens']
         input_mask = batch['input_mask']
-        print(input_tokens.shape, input_mask.shape)
+        print('input_tokens, input_mask:', input_tokens.shape, input_mask.shape)
 
         output_class_tokens = batch['classes_tokens']
-        print(output_class_tokens.shape)
+        print('output_class_tokens:', output_class_tokens.shape)
 
         logits = hf_model.module.apply(
             params, input_tokens, attention_mask=input_mask,
             deterministic=True, rngs=rng_generator(llama_config.rng_keys()),
         ).logits # (batch_size, seq_length, vocab_size)
-        print(logits.shape)
+        print('logits:', logits.shape)
 
-        logits = logits[0, -1, :] # (vocab_size,)
+        logits = logits[0, target_pos, :] # (vocab_size,)
 
         logprobs = jax.nn.log_softmax(logits, axis=0)
         
@@ -233,14 +233,25 @@ def main(argv):
 
             input_mask = np.ones_like(input_tokens)
 
+            # target_pos = input_tokens.shape[1] - 1
+            target_pos = -1
+
+            assert input_tokens.shape[1] == input_mask.shape[1]
+
+            pad_size = FLAGS.seq_length - 64 - input_tokens.shape[1]
+            input_tokens = np.pad(input_tokens, ((0, 0), (pad_size, 0)), mode='constant', constant_values=tokenizer.pad_token_id)
+            input_mask = np.pad(input_mask, ((0, 0), (pad_size, 0)), mode='constant', constant_values=0)
+            
+            print(input_tokens.shape, input_mask.shape, target_pos)
+
             batch = dict(
                 input_tokens=input_tokens,
                 input_mask=input_mask,
-                classes_tokens=classes_tokens,
+                classes_tokens=classes_tokens
             )
             with mesh:
                 logprobs, sharded_rng = forward_next_token_logits(
-                    params, sharded_rng, batch
+                    params, sharded_rng, batch, target_pos
                 )
                 logprobs, = jax.device_get((logprobs,))
             return logprobs
@@ -252,6 +263,12 @@ def main(argv):
             input_tokens = np.array([input_ids])
             input_mask = np.ones_like(input_tokens)
 
+            assert input_tokens.shape[1] == input_mask.shape[1]
+
+            pad_size = FLAGS.seq_length - 64 - input_tokens.shape[1]
+            input_tokens = np.pad(input_tokens, ((0, 0), (pad_size, 0)), mode='constant', constant_values=tokenizer.pad_token_id)
+            input_mask = np.pad(input_mask, ((0, 0), (pad_size, 0)), mode='constant', constant_values=0)
+            
             batch = dict(
                 input_tokens=input_tokens,
                 input_mask=input_mask
@@ -398,6 +415,10 @@ def main(argv):
             if FLAGS.add_bos_token:
                 input_tokens[:, 0] = tokenizer.bos_token_id
                 input_mask[:, 0] = 1
+
+            print(input_tokens.shape)
+            print(input_mask.shape)
+
             batch = dict(
                 input_tokens=input_tokens,
                 attention_mask=input_mask,
